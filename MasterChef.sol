@@ -1,28 +1,53 @@
-// SPDX-License-Identifier: MIT
-pragma solidity 0.6.12;
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/utils/Address.sol";
-import "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/utils/Context.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/math/SafeMath.sol";
-import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+/**
+ *Submitted for verification at snowtrace.io on 2021-11-03
+*/
 
-interface IStrategy {
-    function wantLockedTotal() external view returns (uint256);
-    function earn() external;
-    function deposit(uint256 _wantAmt)
-        external
-        returns (uint256);
-    function withdraw(uint256 _wantAmt)
-        external
-        returns (uint256);
-    function inCaseTokensGetStuck(
-        address _token,
-        uint256 _amount,
-        address _to
-    ) external;
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.7;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/Address.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
+interface MintableToken is IERC20 {
+    function mint(address dest, uint256 amount) external;
+    function transferOwnership(address _minterAddress) external;
+}
+
+interface IHoneycombStrategy {
+    function deposit(address caller, address to, uint256 tokenAmount, uint256 shareAmount) external;
+    function withdraw(address caller, address to, uint256 tokenAmount, uint256 shareAmount) external;
+    function inCaseTokensGetStuck(IERC20 token, address to, uint256 amount) external;
+    function setAllowances() external;
+    function revokeAllowance(address token, address spender) external;
+    function migrate(address newStrategy) external;
+    function onMigration() external;
+    function pendingTokens(uint256 pid, address user, uint256 amount) external view returns (address[] memory, uint256[] memory);
+    function transferOwnership(address newOwner) external;
+    function setPerformanceFeeBips(uint256 newPerformanceFeeBips) external;
+}
+
+interface IStakingRewards {
+    function userInfo(uint256, address) external view returns (uint256, uint256);
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function lastTimeRewardApplicable() external view returns (uint256);
+    function rewardPerToken() external view returns (uint256);
+    function earned(address account) external view returns (uint256);
+    function getRewardForDuration() external view returns (uint256);
+    function deposit(uint256 pid, uint256 amount) external;
+    function withdraw(uint256 pid, uint256 amount) external;
+    function stakeWithPermit(uint256 amount, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external;
+    function withdraw(uint256 amount) external;
+    function getReward() external;
+    function pendingCake(uint256 pid, address user) external view returns (uint256);
+    function exit() external;
+    event RewardAdded(uint256 reward);
+    event Staked(address indexed user, uint256 amount);
+    event Withdrawn(address indexed user, uint256 amount);
+    event RewardPaid(address indexed user, uint256 reward);
+    event RewardsDurationUpdated(uint256 newDuration);
+    event Recovered(address token, uint256 amount);
 }
 
 interface IEarningsReferral {
@@ -30,210 +55,421 @@ interface IEarningsReferral {
     function recordReferralCommission(address _referrer, uint256 _commission) external;
     function getReferrer(address _user) external view returns (address);
     function updateOperator(address _operator, bool _status) external;
-    function drainERC20Token(IERC20 _token, uint256 _amount, address _to) external;
+    function drainBEP20Token(IERC20 _token, uint256 _amount, address _to) external;
 }
 
-contract HoneyToken is ERC20 {
-    uint16 public transferTaxRate = 300;
-    uint16 public constant MAXIMUM_TRANSFER_TAX_RATE = 1000;
-    address public constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
-    address private _operator;
-    event OperatorTransferred(address indexed previousOperator, address indexed newOperator);
-    event TransferTaxRateUpdated(address indexed operator, uint256 previousRate, uint256 newRate);
+contract HoneycombStrategyBase is IHoneycombStrategy, Ownable {
+    using SafeERC20 for IERC20;
 
-    modifier onlyOperator() {
-        require(_operator == msg.sender, "operator: caller is not the operator");
-        _;
+    HoneycombMaster public immutable honeycombMaster;
+    IERC20 public immutable depositToken;
+    uint256 public performanceFeeBips;
+    uint256 internal constant MAX_UINT = 115792089237316195423570985008687907853269984665640564039457584007913129639935;
+    uint256 internal constant ACC_EARNING_PRECISION = 1e18;
+    uint256 internal constant MAX_BIPS = 10000;
+
+    constructor(
+        HoneycombMaster _honeycombMaster,
+        IERC20 _depositToken
+        ){
+        honeycombMaster = _honeycombMaster;
+        depositToken = _depositToken;
+        transferOwnership(address(_honeycombMaster));
     }
 
-    constructor() public ERC20("Honey token", "HONEY") {
-        _operator = _msgSender();
-        emit OperatorTransferred(address(0), _operator);
+    function pendingTokens(uint256, address, uint256) external view virtual override
+        returns (address[] memory, uint256[] memory) {
+        address[] memory _rewardTokens = new address[](1);
+        _rewardTokens[0] = address(0);
+        uint256[] memory _pendingAmounts = new uint256[](1);
+        _pendingAmounts[0] = 0;
+        return(_rewardTokens, _pendingAmounts);
     }
 
-    function mint(address _to, uint256 _amount) public onlyOwner {
-        _mint(_to, _amount);
+    function deposit(address, address, uint256, uint256) external virtual override onlyOwner {
     }
 
-    function _transfer(address sender, address recipient, uint256 amount) internal virtual override {
-        if (recipient == BURN_ADDRESS || transferTaxRate == 0) {
-            super._transfer(sender, recipient, amount);
-        } else {
-            uint256 taxAmount = amount.mul(transferTaxRate).div(10000);
-            uint256 sendAmount = amount.sub(taxAmount);
-            require(amount == sendAmount + taxAmount, "HONEY::transfer: Tax value invalid");
-            super._transfer(sender, BURN_ADDRESS, taxAmount);
-            super._transfer(sender, recipient, sendAmount);
-            amount = sendAmount;
+    function withdraw(address, address to, uint256 tokenAmount, uint256) external virtual override onlyOwner {
+        if (tokenAmount > 0) {
+            depositToken.safeTransfer(to, tokenAmount);
         }
     }
-    
-    function updateTransferTaxRate(uint16 _transferTaxRate) public onlyOperator {
-        require(_transferTaxRate <= MAXIMUM_TRANSFER_TAX_RATE, "HONEY::updateTransferTaxRate: Transfer tax rate must not exceed the maximum rate.");
-        emit TransferTaxRateUpdated(msg.sender, transferTaxRate, _transferTaxRate);
-        transferTaxRate = _transferTaxRate;
+
+    function inCaseTokensGetStuck(IERC20 token, address to, uint256 amount) external virtual override onlyOwner {
+        require(amount > 0, "cannot recover 0 tokens");
+        require(address(token) != address(depositToken), "cannot recover deposit token");
+        token.safeTransfer(to, amount);
     }
 
-    function operator() public view returns (address) {
-        return _operator;
+    function setAllowances() external virtual override onlyOwner {
     }
 
-    function transferOperator(address newOperator) public onlyOperator {
-        require(newOperator != address(0), "HONEY::transferOperator: new operator is the zero address");
-        emit OperatorTransferred(_operator, newOperator);
-        _operator = newOperator;
+    function revokeAllowance(address token, address spender) external virtual override onlyOwner {
+        IERC20(token).safeApprove(spender, 0);
+    }
+
+    function migrate(address newStrategy) external virtual override onlyOwner {
+        uint256 toTransfer = depositToken.balanceOf(address(this));
+        depositToken.safeTransfer(newStrategy, toTransfer);
+    }
+
+    function onMigration() external virtual override onlyOwner {
+    }
+
+    function transferOwnership(address newOwner) public virtual override(Ownable, IHoneycombStrategy) onlyOwner {
+        Ownable.transferOwnership(newOwner);
+    }
+
+    function setPerformanceFeeBips(uint256 newPerformanceFeeBips) external virtual override onlyOwner {
+        require(newPerformanceFeeBips <= MAX_BIPS, "input too high");
+        performanceFeeBips = newPerformanceFeeBips;
     }
 }
 
-contract YetiMaster is Ownable, ReentrancyGuard {
-    using SafeMath for uint256;
-    using SafeBEP20 for IBEP20;
+contract HoneycombStrategyStorage is Ownable {
+    uint256 public rewardTokensPerShare;
+    uint256 internal constant ACC_EARNING_PRECISION = 1e18;
+
+    mapping(address => uint256) public rewardDebt;
+
+    function increaseRewardDebt(address user, uint256 shareAmount) external onlyOwner {
+        rewardDebt[user] += (rewardTokensPerShare * shareAmount) / ACC_EARNING_PRECISION;
+    }
+
+    function decreaseRewardDebt(address user, uint256 shareAmount) external onlyOwner {
+        rewardDebt[user] -= (rewardTokensPerShare * shareAmount) / ACC_EARNING_PRECISION;
+    }
+
+    function setRewardDebt(address user, uint256 userShares) external onlyOwner {
+        rewardDebt[user] = (rewardTokensPerShare * userShares) / ACC_EARNING_PRECISION;
+    }
+
+    function increaseRewardTokensPerShare(uint256 amount) external onlyOwner {
+        rewardTokensPerShare += amount;
+    }
+}
+
+contract HoneycombStrategyForPancake is HoneycombStrategyBase {
+    using SafeERC20 for IERC20;
+
+    IERC20 public constant rewardToken = IERC20(0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82); //CAKE token
+    IStakingRewards public immutable stakingContract;
+    HoneycombStrategyStorage public immutable honeycombStrategyStorage;
+    uint256 public immutable pid;
+    uint256 public immutable pidHoneycomb;
+    //total harvested by the contract all time
+    uint256 public totalHarvested;
+    mapping(address => uint256) public harvested;
+
+    event Harvest(address indexed caller, address indexed to, uint256 harvestedAmount);
+
+    constructor(
+        HoneycombMaster _honeycombMaster,
+        IERC20 _depositToken,
+        uint256 _pid,
+        uint256 _pidHoneycomb,
+        IStakingRewards _stakingContract,
+        HoneycombStrategyStorage _honeycombStrategyStorage
+        )
+        HoneycombStrategyBase(_honeycombMaster, _depositToken)
+    {
+        pid = _pid;
+        pidHoneycomb = _pidHoneycomb;
+        stakingContract = _stakingContract;
+        honeycombStrategyStorage = _honeycombStrategyStorage;
+        _depositToken.safeApprove(address(_stakingContract), MAX_UINT);
+    }
+
+    function checkReward() public view returns (uint256) {
+        return stakingContract.pendingCake(pid, address(this));
+    }
+
+    function pendingRewards(address user) public view returns (uint256) {
+        uint256 userShares = honeycombMaster.userShares(pidHoneycomb, user);
+        uint256 unclaimedRewards = checkReward();
+        uint256 rewardTokensPerShare = honeycombStrategyStorage.rewardTokensPerShare();
+        uint256 totalShares = honeycombMaster.totalShares(pidHoneycomb);
+        uint256 userRewardDebt = honeycombStrategyStorage.rewardDebt(user);
+        uint256 multiplier =  rewardTokensPerShare;
+        if(totalShares > 0) {
+            multiplier = multiplier + ((unclaimedRewards * ACC_EARNING_PRECISION) / totalShares);
+        }
+        uint256 totalRewards = (userShares * multiplier) / ACC_EARNING_PRECISION;
+        uint256 userPendingRewards = (totalRewards >= userRewardDebt) ?  (totalRewards - userRewardDebt) : 0;
+        return userPendingRewards;
+    }
+
+    function rewardTokens() external view virtual returns(address[] memory) {
+        address[] memory _rewardTokens = new address[](1);
+        _rewardTokens[0] = address(rewardToken);
+        return(_rewardTokens);
+    }
+
+    function pendingTokens(uint256, address user, uint256) external view override
+        returns (address[] memory, uint256[] memory) {
+        address[] memory _rewardTokens = new address[](1);
+        _rewardTokens[0] = address(rewardToken);
+        uint256[] memory _pendingAmounts = new uint256[](1);
+        _pendingAmounts[0] = pendingRewards(user);
+        return(_rewardTokens, _pendingAmounts);
+    }
+
+    function harvest() external {
+        _claimRewards();
+        _harvest(msg.sender, msg.sender);
+    }
+
+    function deposit(address caller, address to, uint256 tokenAmount, uint256 shareAmount) external override onlyOwner {
+        _claimRewards();
+        _harvest(caller, to);
+        if (tokenAmount > 0) {
+            stakingContract.deposit(pid, tokenAmount);
+        }
+        if (shareAmount > 0) {
+            honeycombStrategyStorage.increaseRewardDebt(to, shareAmount);
+        }
+    }
+
+    function withdraw(address caller, address to, uint256 tokenAmount, uint256 shareAmount) external override onlyOwner {
+        _claimRewards();
+        _harvest(caller, to);
+        if (tokenAmount > 0) {
+            stakingContract.withdraw(pid, tokenAmount);
+            depositToken.safeTransfer(to, tokenAmount);
+        }
+        if (shareAmount > 0) {
+            honeycombStrategyStorage.decreaseRewardDebt(to, shareAmount);
+        }
+    }
+
+    function migrate(address newStrategy) external override onlyOwner {
+        _claimRewards();
+        (uint256 toWithdraw, ) = stakingContract.userInfo(pid, address(this));
+        if (toWithdraw > 0) {
+            stakingContract.withdraw(pid, toWithdraw);
+            depositToken.safeTransfer(newStrategy, toWithdraw);
+        }
+        uint256 rewardsToTransfer = rewardToken.balanceOf(address(this));
+        if (rewardsToTransfer > 0) {
+            rewardToken.safeTransfer(newStrategy, rewardsToTransfer);
+        }
+        honeycombStrategyStorage.transferOwnership(newStrategy);
+    }
+
+    function onMigration() external override onlyOwner {
+        uint256 toStake = depositToken.balanceOf(address(this));
+        stakingContract.deposit(pid, toStake);
+    }
+
+    function setAllowances() external override onlyOwner {
+        depositToken.safeApprove(address(stakingContract), 0);
+        depositToken.safeApprove(address(stakingContract), MAX_UINT);
+    }
+
+    function _claimRewards() internal {
+        uint256 unclaimedRewards = checkReward();
+        uint256 totalShares = honeycombMaster.totalShares(pidHoneycomb);
+        if (unclaimedRewards > 0 && totalShares > 0) {
+            stakingContract.deposit(pid, 0);
+            honeycombStrategyStorage.increaseRewardTokensPerShare((unclaimedRewards * ACC_EARNING_PRECISION) / totalShares);
+        }
+    }
+
+    function _harvest(address caller, address to) internal {
+        uint256 userShares = honeycombMaster.userShares(pidHoneycomb, caller);
+        uint256 totalRewards = (userShares * honeycombStrategyStorage.rewardTokensPerShare()) / ACC_EARNING_PRECISION;
+        uint256 userRewardDebt = honeycombStrategyStorage.rewardDebt(caller);
+        uint256 userPendingRewards = (totalRewards >= userRewardDebt) ?  (totalRewards - userRewardDebt) : 0;
+        honeycombStrategyStorage.setRewardDebt(caller, userShares);
+        if (userPendingRewards > 0) {
+            totalHarvested += userPendingRewards;
+            if (performanceFeeBips > 0) {
+                uint256 performanceFee = (userPendingRewards * performanceFeeBips) / MAX_BIPS;
+                _safeRewardTokenTransfer(honeycombMaster.performanceFeeAddress(), performanceFee);
+                userPendingRewards = userPendingRewards - performanceFee;
+            }
+            harvested[to] += userPendingRewards;
+            emit Harvest(caller, to, userPendingRewards);
+            _safeRewardTokenTransfer(to, userPendingRewards);
+        }
+    }
+
+    function _safeRewardTokenTransfer(address user, uint256 amount) internal {
+        uint256 rewardTokenBal = rewardToken.balanceOf(address(this));
+        if (amount > rewardTokenBal) {
+            rewardToken.safeTransfer(user, rewardTokenBal);
+        } else {
+            rewardToken.safeTransfer(user, amount);
+        }
+    }
+}
+
+contract HoneycombMaster is Ownable {
+    using SafeERC20 for IERC20;
+
     struct UserInfo {
-        uint256 amount; // How many amount tokens the user has provided.
+        uint256 amount; // How many shares the user currently has
         uint256 rewardDebt; // Reward debt. See explanation below.
         uint256 lastDepositTimestamp; // Timestamp of the last deposit.
     }
+
+    // Info of each pool.
     struct PoolInfo {
-        IBEP20 want; // Address of the want token.
-        uint256 allocPoint; // How many allocation points assigned to this pool. Earnings to distribute per second.
-        uint256 lastRewardTimestamp; // Last timestamp that earnings distribution occurs.
-        uint256 accEarningsPerShare; // Accumulated earnings per share, times 1e12. See below.
-        address strat; // Strategy address that will earnings compound want tokens
-        uint16 depositFeeBP;      // Deposit fee in basis points
+        IERC20 want; // Address of LP token contract.
+        IHoneycombStrategy strategy; // Address of strategy for pool
+        uint256 allocPoint; // How many allocation points assigned to this pool. earnings to distribute per block.
+        uint256 lastRewardTime; // Last block number that earnings distribution occurs.
+        uint256 accEarningPerShare; // Accumulated earnings per share, times ACC_EARNING_PRECISION. See below.
+        uint16 depositFeeBP; // Deposit fee in basis points
+        uint256 totalShares; //total number of shares in the pool
+        uint256 lpPerShare; //number of LP tokens per share, times ACC_EARNING_PRECISION
         bool isWithdrawFee;      // if the pool has withdraw fee
     }
-    address public earningToken;
-    address public devaddr;
-    address public constant burnAddress = 0x000000000000000000000000000000000000dEaD;
-    address public feeAddr;
-    uint256 public earningsPerSecond = 0.02 ether;
-    uint256 public earningsDevPerSecond =  0.002 ether;
-    uint256 public startTimestamp;
-    uint256 public endTimestamp;
-    IEarningsReferral public earningReferral;
-    uint16 public referralCommissionRate = 300;
-    uint16 public constant MAXIMUM_REFERRAL_COMMISSION_RATE = 2000;
-    PoolInfo[] public poolInfo; // Info of each pool.
-    mapping(uint256 => mapping(address => UserInfo)) public userInfo; // Info of each user that stakes LP tokens.
-    uint256 public totalAllocPoint = 0; // Total allocation points. Must be the sum of all allocation points in all pools.
+
+    MintableToken public immutable earningToken;
+    uint256 public startTime;
+    address public dev;
+    address public performanceFeeAddress;
+    uint256 public earningsPerSecond;
+    uint256 public totalAllocPoint = 0;
+    uint256 public devMintBips = 1000;
+    bool public onlyApprovedContractOrEOAStatus;
+    uint256 internal constant ACC_EARNING_PRECISION = 1e18;
+    uint256 internal constant MAX_BIPS = 10000;
+
+    PoolInfo[] public poolInfo;
+    mapping(uint256 => mapping(address => UserInfo)) public userInfo;
+    mapping(address => bool) public approvedContracts;
+    mapping(uint256 => mapping(address => uint256)) public deposits;
+    mapping(uint256 => mapping(address => uint256)) public withdrawals;
+
     uint256[] public withdrawalFeeIntervals = [1];
     uint16[] public withdrawalFeeBP = [0, 0];
     uint16 public constant MAX_WITHDRAWAL_FEE_BP = 300;
     uint16 public constant MAX_DEPOSIT_FEE_BP = 400;
-    event Deposit(address indexed user, uint256 indexed pid, uint256 amount);
-    event Withdraw(address indexed user, uint256 indexed pid, uint256 amount);
-    event EmergencyWithdraw(
-        address indexed user,
-        uint256 indexed pid,
-        uint256 amount
-    );
-    event MigrateToV2(address indexed user, uint256 amount);
-    event SetFeeAddress(address indexed user, address indexed newAddress);
-    event SetDevAddress(address indexed user, address indexed newAddress);
+    
+    IEarningsReferral public earningReferral;
+    uint16 public referralCommissionRate = 300;
+    uint16 public constant MAXIMUM_REFERRAL_COMMISSION_RATE = 2000;
+
+    event Deposit(address indexed user, uint256 indexed pid, uint256 amount, address indexed to);
+    event Withdraw(address indexed user, uint256 indexed pid, uint256 amount, address indexed to);
+    event EmergencyWithdraw(address indexed user, uint256 indexed pid, uint256 amount, address indexed to);
+    event Harvest(address indexed user, uint256 indexed pid, uint256 amount);
+    event DevSet(address indexed oldAddress, address indexed newAddress);
+    event PerformanceFeeAddressSet(address indexed oldAddress, address indexed newAddress);
     event ReferralCommissionPaid(address indexed user, address indexed referrer, uint256 commissionAmount);
-    event NewEarningsEmission(uint256 earningsPerSecond);
-    function poolLength() external view returns (uint256) {
-        return poolInfo.length;
+
+    modifier onlyApprovedContractOrEOA() {
+        if (onlyApprovedContractOrEOAStatus) {
+            require(tx.origin == msg.sender || approvedContracts[msg.sender], "HoneycombMaster::onlyApprovedContractOrEOA");
+        }
+        _;
     }
 
     constructor(
-        address _devaddr,
-        address _feeAddr,
-        uint256 _startTimestamp,
-        uint256 _endTimestamp,
-        address _earningToken
-    ) public {
-        devaddr = _devaddr;
-        feeAddr = _feeAddr;
-        startTimestamp = _startTimestamp;
-        endTimestamp = _endTimestamp;
+        MintableToken _earningToken,
+        uint256 _startTime,
+        address _dev,
+        address _performanceFeeAddress,
+        uint256 _earningsPerSecond
+    ) {
+        require(_startTime > block.timestamp, "must start in future");
         earningToken = _earningToken;
+        startTime = _startTime;
+        dev = _dev;
+        earningsPerSecond = _earningsPerSecond;
+        emit DevSet(address(0), _dev);
+        emit PerformanceFeeAddressSet(address(0), _performanceFeeAddress);
     }
 
-    modifier poolExists(uint256 pid) {
-        require(pid < poolInfo.length, "pool inexistent");
-        _;
-    }
-    
-    function add(
-        uint256 _allocPoint,
-        IBEP20 _want,
-        bool _withUpdate,
-        address _strat,
-        uint16 _depositFeeBP,
-        bool _isWithdrawFee
-    ) public onlyOwner {
-        require(_depositFeeBP <= MAX_DEPOSIT_FEE_BP, "add: invalid deposit fee basis points");
-        if (_withUpdate) {
-            massUpdatePools();
-        }
-        uint256 lastRewardTimestamp =
-            block.timestamp > startTimestamp ? block.timestamp : startTimestamp;
-        totalAllocPoint = totalAllocPoint.add(_allocPoint);
-        poolInfo.push(
-            PoolInfo({
-                want: _want,
-                allocPoint: _allocPoint,
-                lastRewardTimestamp: lastRewardTimestamp,
-                accEarningsPerShare: 0,
-                strat: _strat,
-                depositFeeBP : _depositFeeBP,
-                isWithdrawFee: _isWithdrawFee
-            })
-        );
+    function poolLength() public view returns (uint256) {
+        return poolInfo.length;
     }
 
-    function set(
-        uint256 _pid,
-        uint256 _allocPoint,
-        bool _withUpdate,
-        uint16 _depositFeeBP,
-        bool _isWithdrawFee
-    ) public onlyOwner poolExists(_pid) {
-        require(_depositFeeBP <= MAX_DEPOSIT_FEE_BP, "set: invalid deposit fee basis points");
-        if (_withUpdate) {
-            massUpdatePools();
-        }
-        totalAllocPoint = totalAllocPoint.sub(poolInfo[_pid].allocPoint).add(
-            _allocPoint
-        );
-        poolInfo[_pid].allocPoint = _allocPoint;
-        poolInfo[_pid].depositFeeBP = _depositFeeBP;
-        poolInfo[_pid].isWithdrawFee = _isWithdrawFee;
-    }
-
-    function getMultiplier(uint256 _from, uint256 _to)
-        public
-        view
-        returns (uint256)
-    {
-        if (_from > _to)
-            return 0;
-        return _to.sub(_from);
-    }
-
-    function pendingEarnings(uint256 _pid, address _user)
-        external
-        view
-        returns (uint256)
-    {
-        PoolInfo storage pool = poolInfo[_pid];
-        UserInfo storage user = userInfo[_pid][_user];
-        uint256 accEarningsPerShare = pool.accEarningsPerShare;
-        uint256 wantLockedTotal = IStrategy(pool.strat).wantLockedTotal();
-        uint256 lastTimestamp = endTimestamp < block.timestamp ? endTimestamp : block.timestamp;
-        if (lastTimestamp > pool.lastRewardTimestamp && wantLockedTotal != 0) {
-            uint256 multiplier =
-                getMultiplier(pool.lastRewardTimestamp, lastTimestamp);
-            uint256 earningsReward =
-                multiplier.mul(earningsPerSecond).mul(pool.allocPoint).div(
-                    totalAllocPoint
-                );
-            accEarningsPerShare = accEarningsPerShare.add(
-                earningsReward.mul(1e12).div(wantLockedTotal)
+    function pendingEarnings(uint256 pid, address userAddr) public view returns (uint256) {
+        PoolInfo storage pool = poolInfo[pid];
+        UserInfo storage user = userInfo[pid][userAddr];
+        uint256 accEarningPerShare = pool.accEarningPerShare;
+        uint256 poolShares = pool.totalShares;
+        if (block.timestamp > pool.lastRewardTime && poolShares != 0) {
+            uint256 earningsReward = (reward(pool.lastRewardTime, block.timestamp) * pool.allocPoint) / totalAllocPoint;
+            accEarningPerShare = accEarningPerShare + (
+                (earningsReward * ACC_EARNING_PRECISION) / poolShares
             );
         }
-        return user.amount.mul(accEarningsPerShare).div(1e12).sub(user.rewardDebt);
+        return ((user.amount * accEarningPerShare) / ACC_EARNING_PRECISION) - user.rewardDebt;
+    }
+
+    function pendingTokens(uint256 pid, address user) external view
+        returns (address[] memory, uint256[] memory) {
+        uint256 earningAmount = pendingEarnings(pid, user);
+        (address[] memory strategyTokens, uint256[] memory strategyRewards) =
+            poolInfo[pid].strategy.pendingTokens(pid, user, earningAmount);
+
+        uint256 rewardsLength = 1;
+        for (uint256 j = 0; j < strategyTokens.length; j++) {
+            if (strategyTokens[j] != address(0)) {
+                rewardsLength += 1;
+            }
+        }
+        address[] memory _rewardTokens = new address[](rewardsLength);
+        uint256[] memory _pendingAmounts = new uint256[](rewardsLength);
+        _rewardTokens[0] = address(earningToken);
+        _pendingAmounts[0] = pendingEarnings(pid, user);
+        for (uint256 m = 0; m < strategyTokens.length; m++) {
+            if (strategyTokens[m] != address(0)) {
+                _rewardTokens[m + 1] = strategyTokens[m];
+                _pendingAmounts[m + 1] = strategyRewards[m];
+            }
+        }
+        return(_rewardTokens, _pendingAmounts);
+    }
+
+    function reward(uint256 _lastRewardTime, uint256 _currentTime) public view returns (uint256) {
+        return ((_currentTime - _lastRewardTime) * earningsPerSecond);
+    }
+
+    function earningPerYear() public view returns(uint256) {
+        //31536000 = seconds per year = 365 * 24 * 60 * 60
+        return (earningsPerSecond * 31536000);
+    }
+
+    function earningPerYearToHoneycomb(uint256 pid) public view returns(uint256) {
+        return ((earningPerYear() * poolInfo[pid].allocPoint) / totalAllocPoint);
+    }
+
+    function totalShares(uint256 pid) public view returns(uint256) {
+        return poolInfo[pid].totalShares;
+    }
+
+    function totalLP(uint256 pid) public view returns(uint256) {
+        return (poolInfo[pid].lpPerShare * totalShares(pid) / ACC_EARNING_PRECISION);
+    }
+
+    function userShares(uint256 pid, address user) public view returns(uint256) {
+        return userInfo[pid][user].amount;
+    }
+
+    function updatePool(uint256 pid) public {
+        PoolInfo storage pool = poolInfo[pid];
+        if (block.timestamp > pool.lastRewardTime) {
+            uint256 poolShares = pool.totalShares;
+            if (poolShares == 0 || pool.allocPoint == 0) {
+                pool.lastRewardTime = block.timestamp;
+                return;
+            }
+            uint256 earningReward = (reward(pool.lastRewardTime, block.timestamp) * pool.allocPoint) / totalAllocPoint;
+            pool.lastRewardTime = block.timestamp;
+            if (earningReward > 0) {
+                uint256 toDev = (earningReward * devMintBips) / MAX_BIPS;
+                pool.accEarningPerShare = pool.accEarningPerShare + (
+                    (earningReward * ACC_EARNING_PRECISION) / poolShares
+                );
+                earningToken.mint(dev, toDev);
+                earningToken.mint(address(this), earningReward);
+            }
+        }
     }
 
     function massUpdatePools() public {
@@ -243,213 +479,307 @@ contract YetiMaster is Ownable, ReentrancyGuard {
         }
     }
 
-    function updatePool(uint256 _pid) public {
-        PoolInfo storage pool = poolInfo[_pid];
-        if (block.timestamp <= pool.lastRewardTimestamp) {
-            return;
-        }
-        uint256 lastTimestamp = endTimestamp < block.timestamp ? endTimestamp : block.timestamp;
-        uint256 wantLockedTotal = IStrategy(pool.strat).wantLockedTotal();
-        if (wantLockedTotal == 0) {
-            pool.lastRewardTimestamp = lastTimestamp;
-            return;
-        }
-        
-        uint256 multiplier = getMultiplier(pool.lastRewardTimestamp, lastTimestamp);
-        if (multiplier <= 0) {
-            return;
-        }
-        uint256 earningsReward =  multiplier.mul(earningsPerSecond).mul(pool.allocPoint).div(totalAllocPoint);
-
-        HoneyToken(earningToken).mint(
-            devaddr,
-            multiplier.mul(earningsDevPerSecond).mul(pool.allocPoint).div(
-                totalAllocPoint
-            )
-        );
-
-        HoneyToken(earningToken).mint(
-            address(this),
-            earningsReward
-        );
-
-        pool.accEarningsPerShare = pool.accEarningsPerShare.add(
-            earningsReward.mul(1e12).div(wantLockedTotal)
-        );
-        pool.lastRewardTimestamp = lastTimestamp;
-    }
-
-    function deposit(uint256 _pid,uint256 _wantAmt, address _referrer) public nonReentrant poolExists(_pid){
-        updatePool(_pid);
-        PoolInfo storage pool = poolInfo[_pid];
-        UserInfo storage user = userInfo[_pid][msg.sender];
-
-        if (_wantAmt > 0 && address(earningReferral) != address(0) && _referrer != address(0) && _referrer != msg.sender) {
-            earningReferral.recordReferral(msg.sender, _referrer);
-        }
-        if (user.amount > 0) {
-            uint256 pending =
-                user.amount.mul(pool.accEarningsPerShare).div(1e12).sub(
-                    user.rewardDebt
-                );
-            if (pending > 0) {
-                safeEarningsTransfer(msg.sender, pending);
-                payReferralCommission(msg.sender, pending);
-            }
-        }
-        if (_wantAmt > 0) {
-            uint256 wantBalBefore = IBEP20(pool.want).balanceOf(address(this));
-            pool.want.safeTransferFrom(address(msg.sender), address(this), _wantAmt);
-            uint256 wantBalAfter = IBEP20(pool.want).balanceOf(address(this));
-            _wantAmt = wantBalAfter.sub(wantBalBefore);
-        
-            uint256 amount = _wantAmt;
-            if (pool.depositFeeBP > 0) {
-                uint256 depositFee = _wantAmt.mul(pool.depositFeeBP).div(10000);
-                pool.want.safeTransfer(feeAddr, depositFee);
-                amount = (_wantAmt).sub(depositFee);
-            }
-            pool.want.safeIncreaseAllowance(pool.strat, amount);
-            uint256 amountDeposit =
-                IStrategy(poolInfo[_pid].strat).deposit(amount);
-            user.amount = user.amount.add(amountDeposit);
-            user.lastDepositTimestamp = block.timestamp;
-        }
-        user.rewardDebt = user.amount.mul(pool.accEarningsPerShare).div(1e12);
-        emit Deposit(msg.sender, _pid, _wantAmt);
-    }
-
-    function withdraw(uint256 _pid, uint256 _wantAmt) public nonReentrant poolExists(_pid){
-        updatePool(_pid);
-
-        PoolInfo storage pool = poolInfo[_pid];
-        UserInfo storage user = userInfo[_pid][msg.sender];
-
-        uint256 total = IStrategy(pool.strat).wantLockedTotal();
-
-        require(user.amount > 0, "user.amount is 0");
-        require(total > 0, "Total is 0");
-
-        // Withdraw pending Earnings
-        uint256 pending =
-            user.amount.mul(pool.accEarningsPerShare).div(1e12).sub(
-                user.rewardDebt
-            );
-
-        if (pending > 0) {
-            safeEarningsTransfer(msg.sender, pending);
-            payReferralCommission(msg.sender, pending);
-        }
-
-        // Withdraw want tokens
-        uint256 amount = user.amount;
-        if (_wantAmt > amount) {
-            _wantAmt = amount;
-        }
-        if (_wantAmt > 0) {
-            uint256 amountRemove =
-                IStrategy(pool.strat).withdraw(_wantAmt);
-
-            if (amountRemove > user.amount) {
-                user.amount = 0;
-            } else {
-                user.amount = user.amount.sub(amountRemove);
-            }
-
-            uint256 wantBal = IBEP20(pool.want).balanceOf(address(this));
-            if (wantBal < _wantAmt) {
-                _wantAmt = wantBal;
-            }
-
-            if (pool.isWithdrawFee) {
-                uint16 withdrawFeeBP = getWithdrawFee(_pid, msg.sender);
-                if (withdrawFeeBP > 0) {
-                    uint256 withdrawFee = _wantAmt.mul(withdrawFeeBP).div(10000);
-                    pool.want.safeTransfer(feeAddr, withdrawFee);
-                    _wantAmt = (_wantAmt).sub(withdrawFee);
-                }
+    function deposit(uint256 pid, uint256 amount, address to, address _referrer) external onlyApprovedContractOrEOA {
+        uint256 totalAmount = amount;
+        updatePool(pid);
+        PoolInfo storage pool = poolInfo[pid];
+        if (amount > 0) {
+            UserInfo storage user = userInfo[pid][to];
+            
+            if (address(earningReferral) != address(0) && _referrer != address(0) && _referrer != msg.sender) {
+                earningReferral.recordReferral(msg.sender, _referrer);
             }
             
-            pool.want.safeTransfer(address(msg.sender), _wantAmt);
+            if (pool.depositFeeBP > 0) {
+                uint256 depositFee = amount * pool.depositFeeBP / 10000;
+                pool.want.safeTransfer(performanceFeeAddress, depositFee);
+                amount = amount - depositFee;
+            }
+
+            uint256 newShares = (amount * ACC_EARNING_PRECISION) / pool.lpPerShare;
+            pool.want.safeTransferFrom(
+                address(msg.sender),
+                address(pool.strategy),
+                amount
+            );
+            pool.strategy.deposit(msg.sender, to, amount, newShares);
+            pool.totalShares = pool.totalShares + newShares;
+            user.amount = user.amount + newShares;
+            user.rewardDebt = user.rewardDebt + ((newShares * pool.accEarningPerShare) / ACC_EARNING_PRECISION);
+            user.lastDepositTimestamp = block.timestamp;
+            deposits[pid][to] += totalAmount;
+            emit Deposit(msg.sender, pid, totalAmount, to);
         }
-        user.rewardDebt = user.amount.mul(pool.accEarningsPerShare).div(1e12);
-        emit Withdraw(msg.sender, _pid, _wantAmt);
     }
 
-    function emergencyWithdraw(uint256 _pid) public nonReentrant poolExists(_pid){
-        PoolInfo storage pool = poolInfo[_pid];
-        UserInfo storage user = userInfo[_pid][msg.sender];
+    function withdraw(uint256 pid, uint256 amountShares, address to) external onlyApprovedContractOrEOA {
+        updatePool(pid);
+        PoolInfo storage pool = poolInfo[pid];
+        UserInfo storage user = userInfo[pid][msg.sender];
+        require(user.amount >= amountShares, "withdraw: not good");
 
-        uint256 amount = user.amount;
-        amount = IStrategy(pool.strat).withdraw(amount);
-        
+        if (amountShares > 0) {
+            //find amount of LP tokens from shares
+            uint256 lpFromShares = (amountShares * pool.lpPerShare) / ACC_EARNING_PRECISION;
+
+            if (pool.isWithdrawFee) {
+                uint16 withdrawFeeBP = getWithdrawFee(pid, msg.sender);
+                if (withdrawFeeBP > 0) {
+                    uint256 withdrawFee = lpFromShares * withdrawFeeBP / 10000;
+                    uint256 withdrawFeeShare = amountShares * withdrawFeeBP / 10000;
+                    pool.strategy.withdraw(msg.sender, performanceFeeAddress, withdrawFee, withdrawFeeShare);
+                    lpFromShares = lpFromShares - withdrawFee;
+                    amountShares = amountShares - withdrawFeeShare;
+                }
+            }
+
+            if (pool.totalShares > amountShares) {
+                uint256 lpToSend = lpFromShares;
+                withdrawals[pid][to] += lpToSend;
+                pool.strategy.withdraw(msg.sender, to, lpToSend, amountShares);
+                pool.lpPerShare = pool.lpPerShare + (ACC_EARNING_PRECISION / (pool.totalShares - amountShares));
+            } else {
+                withdrawals[pid][to] += lpFromShares;
+                pool.strategy.withdraw(msg.sender, to, lpFromShares, amountShares);
+            }
+
+            user.amount = user.amount - amountShares;
+            uint256 rewardDebtOfShares = ((amountShares * pool.accEarningPerShare) / ACC_EARNING_PRECISION);
+            uint256 userRewardDebt = user.rewardDebt;
+            user.rewardDebt = (userRewardDebt >= rewardDebtOfShares) ? (userRewardDebt - rewardDebtOfShares) : 0;
+            pool.totalShares = pool.totalShares - amountShares;
+            emit Withdraw(msg.sender, pid, amountShares, to);
+        }
+    }
+
+    function harvest(uint256 pid, address to) external onlyApprovedContractOrEOA {
+        updatePool(pid);
+        PoolInfo storage pool = poolInfo[pid];
+        UserInfo storage user = userInfo[pid][msg.sender];
+
+        uint256 accumulatedEarnings = (user.amount * pool.accEarningPerShare) / ACC_EARNING_PRECISION;
+        uint256 pendings = accumulatedEarnings - user.rewardDebt;
+        user.rewardDebt = accumulatedEarnings;
+
+        if (pendings > 0) {
+            safeEarningsTransfer(to, pendings);
+            payReferralCommission(msg.sender, pendings);
+        }
+        pool.strategy.withdraw(msg.sender, to, 0, 0);
+        emit Harvest(msg.sender, pid, pendings);
+    }
+
+    function withdrawAndHarvest(uint256 pid, uint256 amountShares, address to) external onlyApprovedContractOrEOA {
+        updatePool(pid);
+        PoolInfo storage pool = poolInfo[pid];
+        UserInfo storage user = userInfo[pid][msg.sender];
+        require(user.amount >= amountShares, "withdraw: not good");
+        uint256 accumulatedEarnings = (user.amount * pool.accEarningPerShare) / ACC_EARNING_PRECISION;
+        uint256 pendings = accumulatedEarnings - user.rewardDebt;
+        uint256 lpToSend = (amountShares * pool.lpPerShare) / ACC_EARNING_PRECISION;
+
         if (pool.isWithdrawFee) {
-            uint16 withdrawFeeBP = getWithdrawFee(_pid, msg.sender);
+            uint16 withdrawFeeBP = getWithdrawFee(pid, msg.sender);
             if (withdrawFeeBP > 0) {
-                uint256 withdrawFee = amount.mul(withdrawFeeBP).div(10000);
-                pool.want.safeTransfer(feeAddr, withdrawFee);
-                amount = (amount).sub(withdrawFee);
+                uint256 withdrawFee = lpToSend * withdrawFeeBP / 10000;
+                uint256 withdrawFeeShare = amountShares * withdrawFeeBP / 10000;
+                pool.strategy.withdraw(msg.sender, performanceFeeAddress, withdrawFee, withdrawFeeShare);
+                lpToSend = lpToSend - withdrawFee;
+                amountShares = amountShares - withdrawFeeShare;
             }
         }
 
+        if (pool.totalShares > amountShares) {
+            withdrawals[pid][to] += lpToSend;
+            pool.strategy.withdraw(msg.sender, to, lpToSend, amountShares);
+            pool.lpPerShare = pool.lpPerShare + (ACC_EARNING_PRECISION / (pool.totalShares - amountShares));
+        } else {
+            withdrawals[pid][to] += lpToSend;
+            pool.strategy.withdraw(msg.sender, to, lpToSend, amountShares);
+        }
+
+        user.amount = user.amount - amountShares;
+        uint256 rewardDebtOfShares = ((amountShares * pool.accEarningPerShare) / ACC_EARNING_PRECISION);
+        user.rewardDebt = accumulatedEarnings - rewardDebtOfShares;
+        pool.totalShares = pool.totalShares - amountShares;
+
+        if (pendings > 0) {
+            safeEarningsTransfer(to, pendings);
+            payReferralCommission(msg.sender, pendings);
+        }
+
+        emit Withdraw(msg.sender, pid, amountShares, to);
+        emit Harvest(msg.sender, pid, pendings);
+    }
+
+    function emergencyWithdraw(uint256 pid, address to) external onlyApprovedContractOrEOA {
+        PoolInfo storage pool = poolInfo[pid];
+        UserInfo storage user = userInfo[pid][msg.sender];
+        uint256 amountShares = user.amount;
+        uint256 lpFromShares = (amountShares * pool.lpPerShare) / ACC_EARNING_PRECISION;
+
+        if (pool.isWithdrawFee) {
+            uint16 withdrawFeeBP = getWithdrawFee(pid, msg.sender);
+            if (withdrawFeeBP > 0) {
+                uint256 withdrawFee = lpFromShares * withdrawFeeBP / 10000;
+                uint256 withdrawFeeShare = amountShares * withdrawFeeBP / 10000;
+                pool.strategy.withdraw(msg.sender, performanceFeeAddress, withdrawFee, withdrawFeeShare);
+                lpFromShares = lpFromShares - withdrawFee;
+                amountShares = amountShares - withdrawFeeShare;
+            }
+        }
+
+        if (pool.totalShares > amountShares) {
+            uint256 lpToSend = lpFromShares;
+            withdrawals[pid][to] += lpToSend;
+            pool.strategy.withdraw(msg.sender, to, lpToSend, amountShares);
+            pool.lpPerShare = pool.lpPerShare + (ACC_EARNING_PRECISION / (pool.totalShares - amountShares));
+        } else {
+            withdrawals[pid][to] += lpFromShares;
+            pool.strategy.withdraw(msg.sender, to, lpFromShares, amountShares);
+        }
         user.amount = 0;
         user.rewardDebt = 0;
-        pool.want.safeTransfer(address(msg.sender), amount);
-        emit EmergencyWithdraw(msg.sender, _pid, amount);
+        pool.totalShares = pool.totalShares - amountShares;
+        emit EmergencyWithdraw(msg.sender, pid, amountShares, to);
     }
 
-    function safeEarningsTransfer(address _to, uint256 _EarningsAmt) internal {
-        uint256 EarningsBal = IBEP20(earningToken).balanceOf(address(this));
-        if (_EarningsAmt > EarningsBal) {
-            IBEP20(earningToken).transfer(_to, EarningsBal);
-        } else {
-            IBEP20(earningToken).transfer(_to, _EarningsAmt);
+    function add(uint256 _allocPoint, uint16 _depositFeeBP, IERC20 _want, bool _withUpdate,
+        bool _isWithdrawFee, IHoneycombStrategy _strategy)
+        external onlyOwner {
+        if (_withUpdate) {
+            massUpdatePools();
+        }
+        uint256 lastRewardTime =
+            block.timestamp > startTime ? block.timestamp : startTime;
+        totalAllocPoint = totalAllocPoint + _allocPoint;
+        poolInfo.push(
+            PoolInfo({
+                want: _want,
+                strategy: _strategy,
+                allocPoint: _allocPoint,
+                lastRewardTime: lastRewardTime,
+                accEarningPerShare: 0,
+                depositFeeBP: _depositFeeBP,
+                isWithdrawFee: _isWithdrawFee,
+                totalShares: 0,
+                lpPerShare: ACC_EARNING_PRECISION
+            })
+        );
+    }
+
+    function set(
+        uint256 _pid,
+        uint256 _allocPoint,
+        uint16 _depositFeeBP,
+        bool _withUpdate,
+        bool _isWithdrawFee
+    ) external onlyOwner {
+        if (_withUpdate) {
+            massUpdatePools();
+        }
+        totalAllocPoint = (totalAllocPoint - poolInfo[_pid].allocPoint) + _allocPoint;
+        poolInfo[_pid].allocPoint = _allocPoint;
+        poolInfo[_pid].depositFeeBP = _depositFeeBP;
+        poolInfo[_pid].isWithdrawFee = _isWithdrawFee;
+    }
+
+    function migrateStrategy(uint256 pid, IHoneycombStrategy newStrategy) external onlyOwner {
+        PoolInfo storage pool = poolInfo[pid];
+        //migrate funds from old strategy to new one
+        pool.strategy.migrate(address(newStrategy));
+        //update strategy in storage
+        pool.strategy = newStrategy;
+        newStrategy.onMigration();
+    }
+
+    function setStrategy(uint256 pid, IHoneycombStrategy newStrategy, bool transferOwnership, address newOwner)
+        external onlyOwner {
+        PoolInfo storage pool = poolInfo[pid];
+        if (transferOwnership) {
+            pool.strategy.transferOwnership(newOwner);
+        }
+        pool.strategy = newStrategy;
+    }
+
+    function manualMint(address dest, uint256 amount) external onlyOwner {
+        earningToken.mint(dest, amount);
+    }
+
+    function transferMinter(address newMinter) external onlyOwner {
+        require(newMinter != address(0));
+        earningToken.transferOwnership(newMinter);
+    }
+
+    function setDev(address _dev) external onlyOwner {
+        require(_dev != address(0));
+        emit DevSet(dev, _dev);
+        dev = _dev;
+    }
+
+    function setPerfomanceFeeAddress(address _performanceFeeAddress) external onlyOwner {
+        require(_performanceFeeAddress != address(0));
+        emit PerformanceFeeAddressSet(performanceFeeAddress, _performanceFeeAddress);
+        performanceFeeAddress = _performanceFeeAddress;
+    }
+
+    function setDevMintBips(uint256 _devMintBips) external onlyOwner {
+        require(_devMintBips <= MAX_BIPS, "combined dev & nest splits too high");
+        devMintBips = _devMintBips;
+    }
+
+    function setEarningsEmission(uint256 newEarningsPerSecond, bool withUpdate) external onlyOwner {
+        if (withUpdate) {
+            massUpdatePools();
+        }
+        earningsPerSecond = newEarningsPerSecond;
+    }
+
+    function modifyApprovedContracts(address[] calldata contracts, bool[] calldata statuses) external onlyOwner {
+        require(contracts.length == statuses.length, "input length mismatch");
+        for (uint256 i = 0; i < contracts.length; i++) {
+            approvedContracts[contracts[i]] = statuses[i];
         }
     }
 
-    function inCaseTokensGetStuck(address _token, uint256 _amount)
-        public
-        onlyOwner
-    {
-        require(_token != earningToken, "!safe");
-        IBEP20(_token).safeTransfer(msg.sender, _amount);
+    function setOnlyApprovedContractOrEOAStatus(bool newStatus) external onlyOwner {
+        onlyApprovedContractOrEOAStatus = newStatus;
     }
 
-    function setDevAddress(address _devaddr) public onlyOwner {
-        devaddr = _devaddr;
-        emit SetDevAddress(msg.sender, _devaddr);
+    function inCaseTokensGetStuck(uint256 pid, IERC20 token, address to, uint256 amount) external onlyOwner {
+        IHoneycombStrategy strat = poolInfo[pid].strategy;
+        strat.inCaseTokensGetStuck(token, to, amount);
     }
 
-    function setFeeAddress(address _feeAddress) public onlyOwner {
-        feeAddr = _feeAddress;
-        emit SetFeeAddress(msg.sender, _feeAddress);
-    }
-    
-    function setEarningsReferral(IEarningsReferral _earningReferral) public onlyOwner {
-        earningReferral = _earningReferral;
+    function setAllowances(uint256 pid) external onlyOwner {
+        IHoneycombStrategy strat = poolInfo[pid].strategy;
+        strat.setAllowances();
     }
 
-    function setReferralCommissionRate(uint16 _referralCommissionRate) public onlyOwner {
-        require(_referralCommissionRate <= MAXIMUM_REFERRAL_COMMISSION_RATE, "setReferralCommissionRate: invalid referral commission rate basis points");
-        referralCommissionRate = _referralCommissionRate;
+    function revokeAllowance(uint256 pid, address token, address spender) external onlyOwner {
+        IHoneycombStrategy strat = poolInfo[pid].strategy;
+        strat.revokeAllowance(token, spender);
     }
 
-    function payReferralCommission(address _user, uint256 _pending) internal {
-        if (address(earningReferral) != address(0) && referralCommissionRate > 0) {
-            address referrer = earningReferral.getReferrer(_user);
-            uint256 commissionAmount = _pending.mul(referralCommissionRate).div(10000);
+    function setPerformanceFeeBips(uint256 pid, uint256 newPerformanceFeeBips) external onlyOwner {
+        IHoneycombStrategy strat = poolInfo[pid].strategy;
+        strat.setPerformanceFeeBips(newPerformanceFeeBips);
+    }
 
-            if (referrer != address(0) && commissionAmount > 0) {
-                HoneyToken(earningToken).mint(referrer, commissionAmount);
-                earningReferral.recordReferralCommission(referrer, commissionAmount);
-                emit ReferralCommissionPaid(_user, referrer, commissionAmount);
-            }
+    function accountAddedLP(uint256 pid, uint256 amount) external {
+        PoolInfo storage pool = poolInfo[pid];
+        require(msg.sender == address(pool.strategy), "only callable by strategy contract");
+        pool.lpPerShare = pool.lpPerShare + ((amount * ACC_EARNING_PRECISION) / pool.totalShares);
+    }
+
+    function safeEarningsTransfer(address _to, uint256 _amount) internal {
+        uint256 earningsBal = earningToken.balanceOf(address(this));
+        bool transferSuccess = false;
+        if (_amount > earningsBal) {
+            earningToken.mint(address(this), _amount - earningsBal);
         }
-    }
-    
-    function transferEarningTokenOwnership(address newOwner) public onlyOwner {
-        require(newOwner != address(0), "Ownable: new owner is the zero address");
-        Ownable(earningToken).transferOwnership(newOwner);
+        transferSuccess = earningToken.transfer(_to, _amount);
+        require(transferSuccess, "safeEarningsTransfer: transfer failed");
     }
     
     function getWithdrawFee(uint256 _pid, address _user) public view returns (uint16) {
@@ -457,10 +787,10 @@ contract YetiMaster is Ownable, ReentrancyGuard {
         UserInfo storage user = userInfo[_pid][_user];
         if (!pool.isWithdrawFee)
             return 0;
-        uint256 TimeElapsed = block.timestamp - user.lastDepositTimestamp;
+        uint256 elapsed = block.timestamp - user.lastDepositTimestamp;
         uint i = 0;
         for (; i < withdrawalFeeIntervals.length; i++) {
-            if (TimeElapsed < withdrawalFeeIntervals[i])
+            if (elapsed < withdrawalFeeIntervals[i])
                 break;
         }
         return withdrawalFeeBP[i];
@@ -479,23 +809,25 @@ contract YetiMaster is Ownable, ReentrancyGuard {
         withdrawalFeeBP = _withdrawalFeeBP;
     }
     
-    function setEarningsPerSecond(uint256 _earningsPerSecond) external onlyOwner {
-      earningsPerSecond = _earningsPerSecond;
-      earningsDevPerSecond = _earningsPerSecond.div(10);
-      
-      emit NewEarningsEmission(_earningsPerSecond);
+    function setEarningsReferral(IEarningsReferral _earningReferral) public onlyOwner {
+        earningReferral = _earningReferral;
     }
-    
-    function setStartTimestamp(uint256 _startTimestamp) external onlyOwner {
-        require(block.timestamp < startTimestamp, 'setStartTimestamp: The farming has already started');
-        require(block.timestamp < _startTimestamp, 'setStartTimestamp: _startTimestamp must be larger than now');
-        require(_startTimestamp < endTimestamp, 'setStartTimestamp: _startTimestamp must be smaller than endTimestamp');
-        startTimestamp = _startTimestamp;
+
+    function setReferralCommissionRate(uint16 _referralCommissionRate) public onlyOwner {
+        require(_referralCommissionRate <= MAXIMUM_REFERRAL_COMMISSION_RATE, "setReferralCommissionRate: invalid referral commission rate basis points");
+        referralCommissionRate = _referralCommissionRate;
     }
-    
-    function setEndTimestamp(uint256 _endTimestamp) external onlyOwner {
-        require(startTimestamp < _endTimestamp, 'setEndTimestamp: _endTimestamp must be larger than startTimestamp');
-        require(block.timestamp < _endTimestamp, 'setEndTimestamp: _endTimestamp must be larger than now');
-        endTimestamp = _endTimestamp;
+
+    function payReferralCommission(address _user, uint256 _pending) internal {
+        if (address(earningReferral) != address(0) && referralCommissionRate > 0) {
+            address referrer = earningReferral.getReferrer(_user);
+            uint256 commissionAmount = _pending * referralCommissionRate / 10000;
+
+            if (referrer != address(0) && commissionAmount > 0) {
+                earningToken.mint(referrer, commissionAmount);
+                earningReferral.recordReferralCommission(referrer, commissionAmount);
+                emit ReferralCommissionPaid(_user, referrer, commissionAmount);
+            }
+        }
     }
 }
