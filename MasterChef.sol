@@ -7,7 +7,18 @@ pragma solidity ^0.8.7;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/Address.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
+
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+}
 
 interface MintableToken is IERC20 {
     function mint(address dest, uint256 amount) external;
@@ -492,7 +503,7 @@ contract HoneycombMaster is Ownable {
             
             if (pool.depositFeeBP > 0) {
                 uint256 depositFee = amount * pool.depositFeeBP / 10000;
-                pool.want.safeTransfer(performanceFeeAddress, depositFee);
+                pool.want.safeTransferFrom(address(msg.sender), performanceFeeAddress, depositFee);
                 amount = amount - depositFee;
             }
 
@@ -537,7 +548,6 @@ contract HoneycombMaster is Ownable {
                 uint256 lpToSend = lpFromShares;
                 withdrawals[pid][to] += lpToSend;
                 pool.strategy.withdraw(msg.sender, to, lpToSend, amountShares);
-                pool.lpPerShare = pool.lpPerShare + (ACC_EARNING_PRECISION / (pool.totalShares - amountShares));
             } else {
                 withdrawals[pid][to] += lpFromShares;
                 pool.strategy.withdraw(msg.sender, to, lpFromShares, amountShares);
@@ -592,7 +602,6 @@ contract HoneycombMaster is Ownable {
         if (pool.totalShares > amountShares) {
             withdrawals[pid][to] += lpToSend;
             pool.strategy.withdraw(msg.sender, to, lpToSend, amountShares);
-            pool.lpPerShare = pool.lpPerShare + (ACC_EARNING_PRECISION / (pool.totalShares - amountShares));
         } else {
             withdrawals[pid][to] += lpToSend;
             pool.strategy.withdraw(msg.sender, to, lpToSend, amountShares);
@@ -633,7 +642,6 @@ contract HoneycombMaster is Ownable {
             uint256 lpToSend = lpFromShares;
             withdrawals[pid][to] += lpToSend;
             pool.strategy.withdraw(msg.sender, to, lpToSend, amountShares);
-            pool.lpPerShare = pool.lpPerShare + (ACC_EARNING_PRECISION / (pool.totalShares - amountShares));
         } else {
             withdrawals[pid][to] += lpFromShares;
             pool.strategy.withdraw(msg.sender, to, lpFromShares, amountShares);
